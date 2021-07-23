@@ -1,10 +1,5 @@
-from CRM_Tables import *
+import datetime
 
-param_lists = {
-            Departments: ["department_name"],
-            Employees: ["fio", "position", "department_id"],
-            Orders: ["order_type", "descriptions", "status", "customer", "creator_id"]
-        }
+print(datetime.datetime.now().date())
 
-print(Departments in param_lists)
 
