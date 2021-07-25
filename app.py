@@ -3,8 +3,9 @@ from datetime import datetime
 from json import JSONDecodeError
 import sqlalchemy.exc
 from flask import request, render_template
-from CRM_Tables import Departments, Employees, Orders, Customers
+from models import Departments, Employees, Orders, Customers, CustomersFromTg
 from sets import db, my_app
+from notification import order_notifications, employee_notification
 
 
 def is_json(myjson):
@@ -15,59 +16,26 @@ def is_json(myjson):
     return False
 
 
-def department_get_dict(d):
-    return {"Name": d.department_name,
-            "Id": d.id,
-            "Create date": str(d.create_dt),
-            "Update date": str(d.update_dt)}
-
-
-def employ_get_dict(e):
-    return {"ID": e.id,
-            "Fio": e.fio,
-            "Position": e.position,
-            "Department ID": e.department_id,
-            "Create date": str(e.create_dt),
-            "Update date": str(e.update_dt)}
-
-
-def order_get_dict(o):
-    return {"ID": o.id,
-            "Order type": o.order_type,
-            "Descriptions": o.descriptions,
-            "Status": o.status,
-            "Creator ID": o.creator_id,
-            "Customer Id": o.customer_id,
-            "Create date": str(o.create_dt),
-            "Update date": str(o.update_dt)}
-
-
-def customer_get_dict(c):
-    return {"ID": c.user_id,
-            "Nickname": c.nickname,
-            "Password": c.password,
-            "Create date": c.create_dt
-            }
-
-
 def get_columns_by_class(cls):
     dct = {Departments: ["department_name"],
-           Employees: ["fio", "position", "department_id"],
-           Orders: ["order_type", "descriptions", "status", "customer_id", "creator_id"]}
+           Employees: ["fio", "position", "department_id", "tg_username", "chat_id"],
+           Orders: ["order_type", "descriptions", "status", "tg_mickname", "creator_id"]}
     return dct[cls]
 
 
-def get_insert_querys_by_class(data, cls):
+def insert_into_db(data, cls):
     if issubclass(cls, Orders):
         get_creator_id = Employees.query.get(data["creator_id"])
-        get_nickname = Customers.query.get(data["customer_id"])
-        if get_nickname is not None and get_creator_id is not None:
+        get_customer = Customers.query.filter_by(nickname=str(data["tg_mickname"])).first()
+        get_tg_customer = CustomersFromTg.query.filter_by(user_id=get_customer.user_id).first()
+        if (get_customer is not None) and (get_creator_id is not None) and (get_tg_customer is not None):
             if data["status"] == "Active" or data["status"] == "Closed":
-                return Orders(order_type=data["order_type"],
-                              descriptions=data["descriptions"],
-                              status=data["status"],
-                              customer_id=get_nickname.user_id,
-                              creator_id=get_creator_id.id)
+                o = Orders(order_type=data["order_type"],
+                           descriptions=data["descriptions"],
+                           status=data["status"],
+                           customer_id=get_customer.user_id,
+                           creator_id=get_creator_id.id)
+                order_notifications(get_tg_customer.chat_id, o.id, "created")
             else:
                 raise KeyError("order_type shuold be Acitve or Closed")
         else:
@@ -75,9 +43,13 @@ def get_insert_querys_by_class(data, cls):
     elif issubclass(cls, Employees):
         get_deparment_id = Departments.query.get(data["department_id"])
         if get_deparment_id is not None:
-            return Employees(fio=data["fio"],
-                             position=data["position"],
-                             department_id=get_deparment_id.id)
+            e = Employees(fio=data["fio"],
+                          position=data["position"],
+                          department_id=get_deparment_id.id,
+                          tg_username=data["tg_username"],
+                          chat_id=data["chat_id"])
+            employee_notification(e.chat_id, e.id)
+            return e
         else:
             raise KeyError("Wrong department_id")
     elif issubclass(cls, Departments):
@@ -100,7 +72,7 @@ def create_validator(cls):
         if sorted(data.keys()) != sorted(param_list) or is_json(request.data):
             raise ValueError
 
-        insert_query = get_insert_querys_by_class(data, cls)
+        insert_query = insert_into_db(data, cls)
 
         db.session.add(insert_query)
         db.session.commit()
@@ -115,10 +87,8 @@ def create_validator(cls):
     return f"Successfully created, ID: {insert_query.id}"
 
 
-def delete_validator(id_, list_id, cls):
+def delete_validator(id_, cls):
     try:
-        if id_ not in list_id:
-            return "Wrong param"
         db.session.delete(cls.query.get(id_))
         db.session.commit()
     except sqlalchemy.exc.IntegrityError as exc:
@@ -130,9 +100,13 @@ def update_value(class_instance, column, new_value):
     if column in ["department_name"]:
         class_instance.department_name = new_value
         return True
-    elif column in ["fio", "position"]:
+    elif column in ["fio", "position", "tg_username", "chat_id"]:
         if column == "fio":
             class_instance.fio = new_value
+        elif column == "tg_username":
+            class_instance.tg_username = new_value
+        elif column == "chat_id":
+            class_instance.chat_id = new_value
         elif column == "position":
             class_instance.position = new_value
         return True
@@ -166,10 +140,12 @@ def update_validator(column, cls):
 
         db.session.add(class_instance)
         db.session.commit()
+        chat_id = get_chat_id_for_order(data["Id"])
+        order_notifications(chat_id, data["Id"], "update")
         return "Successfully updated"
     else:
         column_list = {Departments: ["department_name"],
-                       Employees: ["fio", "position"],
+                       Employees: ["fio", "position", "tg_username", "chat_id"],
                        Orders: ["order_type", "descriptions", "status"]}[cls]
         return f"Wrong column, allowed columns {column_list}"
 
@@ -181,6 +157,11 @@ def check_id(id_, cls):
         return True
 
     return False
+
+
+@my_app.route("/", methods=["GET"])
+def mainpage():
+    return render_template("mainpage.html")
 
 
 # Create routes
@@ -202,62 +183,71 @@ def ord_create_new_param():
 # Get routes
 @my_app.route("/departments/get/all", methods=["GET"])
 def dep_get_data():
-    return render_template('get_data.html', lst=[department_get_dict(i) for i in Departments.query.all()])
+    return render_template('show_department.html', data=[i for i in Departments.query.all()])
 
 
 @my_app.route("/employees/get/all", methods=["GET"])
 def emp_get_data():
-    return render_template('get_data.html', lst=[employ_get_dict(i) for i in Employees.query.all()])
+    return render_template('show_employee.html', data=[i for i in Employees.query.all()])
 
 
 @my_app.route("/orders/get/all", methods=["GET"])
 def ord_get_data():
-    return render_template('get_data.html', lst=[order_get_dict(i) for i in Orders.query.all()])
-
-
-@my_app.route("/customers/get/all", methods=["GET"])
-def cust_get_data():
-    return render_template('get_data.html', lst=[customer_get_dict(i) for i in Customers.query.all()])
+    return render_template('show_order.html', data=[i for i in Orders.query.all()])
 
 
 @my_app.route("/departments/get/<int:id_>", methods=["GET"])
 def dep_get_data_by_id(id_):
     if check_id(id_, Departments):
         return "Non-existent id"
-    return department_get_dict(Departments.query.get(id_))
+    return render_template('show_order.html', data=[Departments.query.get(id_)])
 
 
 @my_app.route("/employees/get/<int:id_>", methods=["GET"])
 def emp_get_data_by_id(id_):
     if check_id(id_, Employees):
         return "Non-existent id"
-    return employ_get_dict(Employees.query.get(id_))
+    return render_template('show_order.html', data=[Employees.query.get(id_)])
 
 
 @my_app.route("/orders/get/<int:id_>", methods=["GET"])
 def ord_get_data_by_id(id_):
     if check_id(id_, Orders):
         return "Non-existent id"
-    return order_get_dict(Orders.query.get(id_))
+    return render_template('show_order.html', data=[Orders.query.get(id_)])
 
 
 # Delete routes
 @my_app.route("/departments/delete/<int:id_>", methods=["DELETE"])
 def dep_delete_data_by_id(id_):
-    list_id = get_lists_id(Departments)
-    return delete_validator(id_=id_, list_id=list_id, cls=Departments)
+    if check_id(id_, Departments):
+        return "Non-existent id"
+    return delete_validator(id_=id_, cls=Departments)
 
 
 @my_app.route("/employees/delete/<int:id_>", methods=["DELETE"])
 def emp_delete_data_by_id(id_):
-    list_id = get_lists_id(Employees)
-    return delete_validator(id_=id_, list_id=list_id, cls=Employees)
+    if check_id(id_, Employees):
+        return "Non-existent id"
+    return delete_validator(id_=id_, cls=Employees)
 
 
 @my_app.route("/orders/delete/<int:id_>", methods=["DELETE"])
 def ord_delete_data_by_id(id_):
-    list_id = get_lists_id(Orders)
-    return delete_validator(id_=id_, list_id=list_id, cls=Orders)
+    if not check_id(id_, Orders):
+        chat_id = get_chat_id_for_order(id_)
+        order_notifications(chat_id, id_, "deleted")
+        return delete_validator(id_=id_, cls=Orders)
+    else:
+        return "non-existent id"
+
+
+def get_chat_id_for_order(id_):
+    if not check_id(id_, Orders):
+        order = Orders.query.get(id_)
+        get_customer = Customers.query.filter_by(user_id=order.customer_id).first()
+        get_tg_customer = CustomersFromTg.query.filter_by(user_id=get_customer.user_id).first()
+        return get_tg_customer.chat_id
 
 
 # Update toutes
@@ -280,7 +270,7 @@ def ord_update_data_by_id(column):
 @my_app.route("/fiters/get/orders/by_customer_id/<int:id_>",  methods=["GET"])
 def get_orders_by_cutomers(id_):
     data = Orders.query.filter_by(customer_id=id_).all()
-    return render_template('get_data.html', lst=[order_get_dict(i) for i in data])
+    return render_template("show_filters.html", data=[i for i in data], title="Orders by cutomer id")
 
 
 @my_app.route("/fiters/get/orders/by_date",  methods=["GET"])
@@ -294,10 +284,10 @@ def get_orders_by_date():
         start_date = datetime.strptime(data['start_date'], '%Y-%m-%d')
         end_date = datetime.strptime(data['end_date'], '%Y-%m-%d')
         dates = Orders.query.filter(Orders.create_dt >= start_date, Orders.create_dt <= end_date).all()
-        return render_template('get_data.html', lst=[order_get_dict(i) for i in dates])
+        return render_template('show_order.html', data=[i for i in dates])
     elif "start_date" in data:
         dates = Orders.query.filter(Orders.create_dt >= data['start_date']).all()
-        return render_template('get_data.html', lst=[order_get_dict(i) for i in dates])
+        return render_template("show_filters.html", data=[i for i in dates], title="Orders by dates")
     else:
         return f'Should be a format dict or json (with keys: {"start_date", "end_date"} or {"start_date"})'
 
@@ -313,13 +303,13 @@ def get_orders_by_status():
         return "Should be a format dict or json (with keys: 'status')"
 
     statuses = Orders.query.filter_by(status=data['status']).all()
-    return render_template('get_data.html', lst=[order_get_dict(i) for i in statuses])
+    return render_template("show_filters.html", data=[i for i in statuses], title="Orders by status")
 
 
 @my_app.route("/fiters/get/orders/by_creator_id/<int:id_>", methods=['GET'])
 def get_orders_by_creator_id(id_):
     data = Orders.query.filter_by(creator_id=id_).all()
-    return render_template('get_data.html', lst=[order_get_dict(i) for i in data])
+    return render_template("show_filters.html", data=[i for i in data], title="Orders by creator id")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 from datetime import datetime
-from CRM_Tables import Customers, CustomersFromTg
+from models import Customers, CustomersFromTg, Orders
 from telebot import TeleBot
 from sets import db
 from envparse import Env
@@ -21,33 +21,49 @@ def log_in(message):
 
 
 @bot.message_handler(commands=["subscribe_me"])
-def subscribe_profile(message):
-    global username, access
-    if access:
-        data_by_user_name = CustomersFromTg.query.filter(CustomersFromTg.username == username).first()
-        if data_by_user_name.is_subscribed:
-            bot.send_message(message.chat.id, "Ти вже підисаний на повідомлення")
-        else:
-            data_by_user_name.is_subscribed = True
-            db.session.commit()
-            bot.send_message(message.chat.id, "Ти успішно підписався на повідомлення")
-    else:
-        bot.send_message(message.chat.id, "Для початку ввійди в аккунт /log_in")
+def subscribe_by_username(message):
+    msg = bot.send_message(message.chat.id, "Введи свій telegram username ")
+    bot.register_next_step_handler(msg, subscribe_profile)
 
 
 @bot.message_handler(commands=["unsubscribe_me"])
-def unsubscribe_profile(message):
-    global username, access
-    if access:
+def subscribe_by_username(message):
+    msg = bot.send_message(message.chat.id, "Введи свій telegram username ")
+    bot.register_next_step_handler(msg, unsubscribe_profile)
+
+
+def subscribe_profile(message):
+    username = message.text
+    if check_username(username):
         data_by_user_name = CustomersFromTg.query.filter(CustomersFromTg.username == username).first()
-        if not data_by_user_name.is_subscribed:
-            bot.send_message(message.chat.id, "Ти вже відписаний від повідомлення")
+        if data_by_user_name.access == "Customer":
+            if data_by_user_name.is_subscribed:
+                bot.send_message(message.chat.id, "Ти вже підисаний на повідомлення")
+            else:
+                data_by_user_name.is_subscribed = True
+                db.session.commit()
+                bot.send_message(message.chat.id, "Ти успішно підписався на повідомлення")
         else:
-            data_by_user_name.is_subscribed = False
-            db.session.commit()
-            bot.send_message(message.chat.id, "Ти успішно відписався від повідомлень")
+            bot.send_message(message.chat.id, "Для початку ввійди в аккунт /log_in")
     else:
-        bot.send_message(message.chat.id, "Для початку ввійди в аккунт /log_in")
+        bot.send_message(message.chat.id, "Неправильний username")
+
+
+def unsubscribe_profile(message):
+    username = message.text
+    if check_username(username):
+        data_by_user_name = CustomersFromTg.query.filter(CustomersFromTg.username == username).first()
+        if data_by_user_name.access == "Customer":
+            if not data_by_user_name.is_subscribed:
+                bot.send_message(message.chat.id, "Ти вже відписаний від повідомлення")
+            else:
+                data_by_user_name.is_subscribed = False
+                db.session.commit()
+                bot.send_message(message.chat.id, "Ти успішно відписався від повідомлень")
+        else:
+            bot.send_message(message.chat.id, "Для початку ввійди в аккунт /log_in")
+    else:
+        bot.send_message(message.chat.id, "Неправильний username")
 
 
 def log_in_customer(message):
@@ -63,9 +79,9 @@ def log_in_customer(message):
         else:
             if get_user_id.password == password:
                 bot.send_message(message.chat.id, 'Ти успішно ввійшов в свій акаунт, тепер тобі доступні деякі команди')
-                global access, username
-                username = message.chat.username
-                access = True
+                get_tg_customer = CustomersFromTg.query.filter(CustomersFromTg.user_id == get_user_id.user_id).first()
+                get_tg_customer.access = "Customer"
+                db.session.commit()
             else:
                 bot.send_message(message.chat.id, 'Неправильний пароль, спробуй ще раз /log_in')
 
@@ -75,7 +91,8 @@ def reg(message):
     username_list = [i.username for i in CustomersFromTg.query.all()]
 
     if message.chat.username in username_list:
-        msg = bot.send_message(message.chat.id, "Ваш username уже зареєстрований, хочете створити новий акаунт? (y/n)")
+        msg = bot.send_message(message.chat.id, "Ваш username уже зареєстрований (всі заявки будуть удаленні),"
+                                                "хочете створити новий акаунт? (y/n)")
         bot.register_next_step_handler(msg, choise)
     else:
         msg = bot.send_message(message.chat.id, "Для регестарції введи новий 𝐧𝐢𝐜𝐤𝐧𝐚𝐦𝐞 і 𝐩𝐚𝐬𝐬𝐰𝐨𝐫𝐝 ")
@@ -108,6 +125,7 @@ def choise(message):
     if msg == 'y':
         TgCustomers_data = CustomersFromTg.query.filter(CustomersFromTg.username == message.chat.username).first()
         Customers_data = Customers.query.filter(Customers.user_id == TgCustomers_data.customer_id).first()
+        Orders.query.filter(Orders.customer_id == Customers_data.user_id).delete()
         db.session.delete(TgCustomers_data)
         db.session.commit()
         db.session.delete(Customers_data)
@@ -131,4 +149,13 @@ def save_in_table(message, nickname):
     db.session.commit()
 
 
+def check_username(username):
+    usernames = [i.username for i in CustomersFromTg.query.all()]
+    if username in usernames:
+        return True
+    return False
+
+
 bot.polling()
+
+
